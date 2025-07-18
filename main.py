@@ -1,56 +1,48 @@
-const { OpenAI } = require('openai');
+import os
+import asyncio
+import aiofiles
+import json
+import argparse
+from openai import AsyncOpenAI, RateLimitError
+from tqdm.asyncio import tqdm_asyncio
+from aiocsv import AsyncReader, AsyncDictWriter
+import random
+import time
 
-// Initialize OpenAI client with API key handling
-const initializeOpenAI = () => {
-    const apiKey = process.env.OPENAI_API_KEY;
+# --- Configuration ---
+# WARNING: Storing API keys directly in code is a security risk.
+# This is for temporary, non-production use only.
+# For production, use environment variables.
+API_KEY = "s"
 
-    if (!apiKey) {
-        console.log('❌ No API key found in environment variables.');
-        console.log('Please enter your OpenAI API key:');
+client = AsyncOpenAI(api_key=API_KEY)
 
-        const readline = require('readline').createInterface({
-            input: process.stdin,
-            output: process.stdout
-        });
+SYSTEM_PROMPT = """You are a highly specialized AI engine designed for one purpose: to accurately identify the country from a given address string. You must be precise and avoid making assumptions.
 
-        return new Promise((resolve) => {
-            readline.question('OpenAI API Key: ', (key) => {
-                readline.close();
-                process.env.OPENAI_API_KEY = key;
-                return resolve(new OpenAI({ apiKey: key }));
-            });
-        });
-    }
+Your task is to analyze the provided batch of addresses, which may be incomplete or in any language, and return the country information for each one.
 
-    return Promise.resolve(new OpenAI({ apiKey }));
-};
+You will receive a JSON array of address strings in the user message. You MUST respond with a valid JSON object containing a single key "results". This key should hold a JSON array of objects, where each object corresponds to an address in the input array and maintains the original order.
 
-async function getCountryFromAddress(address, openai) {
-    try {
-        console.log(`\n📝 Processing address: ${address}`);
-
-        // Add basic input validation
-        if (!address || address.trim().length < 3) {
-            throw new Error('Address is too short or empty to determine location');
-        }
-
-        const completion = await openai.chat.completions.create({
-            model: "gpt-4o",  // Keeping the correct model name
-            messages: [
-                {
-                    role: "system",
-                    content: `You are a highly specialized AI engine designed for one purpose: to accurately identify the country from a given address string. You must be precise and avoid making assumptions.
-
-Your task is to analyze the provided address, which may be incomplete or in any language, and return the country information in a specific JSON format.
-
-### JSON Output Structure
-You MUST respond with a valid JSON object in the following format. Do not include any other text or explanations.
-
+### BATCH OUTPUT JSON STRUCTURE
+Your entire response must be a single JSON object like this. Do not include any other text or explanations.
 {
-  "shortForm": "The 2-letter ISO 3166-1 alpha-2 country code in UPPERCASE. Use 'UNKNOWN' if the country cannot be determined with high confidence.",
-  "longForm": "The full, official English name of the country. Use 'UNKNOWN' if the country cannot be determined.",
-  "confidence": "A floating-point number between 0.0 and 1.0 representing your confidence in the result."
+  "results": [
+    {
+      "shortForm": "The 2-letter ISO 3166-1 alpha-2 country code...",
+      "longForm": "The full, official English name of the country...",
+      "confidence": "A floating-point number from 0.0 to 1.0..."
+    },
+    {
+      "shortForm": "...",
+      "longForm": "...",
+      "confidence": "..."
+    }
+  ]
 }
+
+### RULES FOR EACH INDIVIDUAL ADDRESS
+
+For each address in the input batch, apply the following logic:
 
 ### Analysis and Confidence Rules
 1.  **Basis of Identification**: Your decision must be based on concrete evidence within the address string. Look for:
@@ -68,151 +60,143 @@ You MUST respond with a valid JSON object in the following format. Do not includ
     *   **0.0**: No geographic information at all.
 
 3.  **When to use 'UNKNOWN'**:
-    *   If the calculated confidence is less than 0.5, you MUST return 'UNKNOWN' for \`shortForm\` and \`longForm\`.
+    *   If the calculated confidence is less than 0.5, you MUST return 'UNKNOWN' for `shortForm` and `longForm`.
     *   If the input is gibberish, a single generic word, or lacks any geographical clues (e.g., "my house", "123456").
     *   If the address is ambiguous and could plausibly belong to multiple countries with similar confidence scores.
 
-### Examples
+### Examples of Individual Address Analysis
 
-**User Input:** "1600 Pennsylvania Avenue NW, Washington, DC 20500"
-**Your Response:**
+**Input Address:** "1600 Pennsylvania Avenue NW, Washington, DC 20500"
+**Resulting JSON Object:**
 {
   "shortForm": "US",
   "longForm": "United States",
   "confidence": 1.0
 }
 
-**User Input:** "Tour Eiffel, Champ de Mars, 5 Av. Anatole France, 75007 Paris"
-**Your Response:**
+**Input Address:** "Tour Eiffel, Champ de Mars, 5 Av. Anatole France, 75007 Paris"
+**Resulting JSON Object:**
 {
   "shortForm": "FR",
   "longForm": "France",
   "confidence": 0.9
 }
 
-**User Input:** "some random street"
-**Your Response:**
+**Input Address:** "some random street"
+**Resulting JSON Object:**
 {
   "shortForm": "UNKNOWN",
   "longForm": "UNKNOWN",
   "confidence": 0.0
 }
+"""
 
-**User Input:** "Bahnhofstraße 1, 8001 Zürich"
-**Your Response:**
-{
-  "shortForm": "CH",
-  "longForm": "Switzerland",
-  "confidence": 0.9
-}
+# --- Core Functions ---
+async def process_address_batch_with_backoff(batch, semaphore, writer):
+    """
+    Analyzes a batch of addresses with exponential backoff for retries.
+    """
+    initial_delay = 1
+    exponential_base = 2
+    max_retries = 10
+    num_retries = 0
+    delay = initial_delay
 
-**User Input:** "48 Pirrama Rd, Pyrmont NSW 2009"
-**Your Response:**
-{
-  "shortForm": "AU",
-  "longForm": "Australia",
-  "confidence": 0.95
-}`
-                },
-                {
-                    role: "user",
-                    content: `Return JSON: Extract the country from this address (which may be incomplete): ${address}`
-                }
-            ],
-            temperature: 0.1,
-            response_format: { type: "json_object" }
-        });
+    while True:
+        try:
+            async with semaphore:
+                valid_addresses = [addr for addr in batch if addr and addr.strip()]
+                if not valid_addresses:
+                    return
 
-        // Validate API response structure
-        if (!completion?.choices?.[0]?.message) {
-            throw new Error('Invalid API response structure');
-        }
+                completion = await client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": json.dumps(valid_addresses)}
+                    ],
+                    temperature=0.1,
+                    response_format={"type": "json_object"}
+                )
 
-        const result = JSON.parse(completion.choices[0].message.content);
+                response_data = json.loads(completion.choices[0].message.content)
+                results = response_data.get("results", [])
 
-        // Validate result and confidence
-        if (!result.shortForm || !result.longForm || typeof result.confidence !== 'number') {
-            throw new Error('Invalid response format');
-        }
+                for i, address in enumerate(valid_addresses):
+                    result_line = {"address": address}
+                    if i < len(results) and results[i].get("confidence", 0.0) >= 0.7 and results[i].get("shortForm") != "UNKNOWN":
+                        result_line.update(results[i])
+                    else:
+                        result_line["error"] = "Confidence too low or unknown"
+                    await writer.writerow(result_line)
+                return # Success, exit loop
 
-        // Handle low confidence or UNKNOWN results
-        if (result.confidence < 0.7 || result.shortForm === "UNKNOWN") {
-            throw new Error('Unable to determine country with sufficient confidence');
-        }
+        except RateLimitError as e:
+            num_retries += 1
+            if num_retries > max_retries:
+                raise Exception(f"Maximum retries exceeded for batch starting with: {batch[0]}")
+            
+            delay *= exponential_base * (1 + random.random())
+            print(f"Rate limit exceeded. Retrying in {delay:.2f} seconds...")
+            await asyncio.sleep(delay)
 
-        return {
-            shortForm: result.shortForm,
-            longForm: result.longForm,
-            confidence: result.confidence
-        };
+        except Exception as e:
+            for address in batch:
+                await writer.writerow({"address": address, "error": f"Batch failed: {str(e)}"})
+            return # Exit loop after handling non-retryable error
 
-    } catch (error) {
-        // Check for specific API errors
-        if (error.response?.status === 429) {
-            throw new Error('Rate limit exceeded. Please try again in a few moments.');
-        }
-        if (error.response?.status === 500) {
-            throw new Error('AI service temporarily unavailable. Please try again later.');
-        }
 
-        // If it's our custom error, pass it through
-        if (error.message.includes('Unable to determine country') ||
-            error.message.includes('too short') ||
-            error.message.includes('Invalid')) {
-            throw error;
-        }
+def create_batches(items, size):
+    """Yield successive n-sized chunks from list."""
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
 
-        // For unexpected errors, log them but return a user-friendly message
-        console.error('❌ Error:', error);
-        throw new Error('Unable to process address. Please try again with more specific details.');
-    }
-}
+# --- Main Execution ---
+async def main(input_csv: str, output_csv: str, concurrency: int, batch_size: int):
+    """
+    Main function to orchestrate the bulk processing of addresses from a CSV file.
+    """
+    if not os.path.isfile(input_csv):
+        print(f"❌ Error: Input CSV file '{input_csv}' not found.")
+        return
 
-// Modified main function to handle multiple addresses
-async function main() {
-    try {
-        // Initialize OpenAI first
-        const openai = await initializeOpenAI();
+    addresses = []
+    async with aiofiles.open(input_csv, 'r', newline='', encoding='utf-8') as infile:
+        reader = AsyncReader(infile)
+        await reader.__anext__() # Skip header
+        async for row in reader:
+            if row:
+                addresses.append(row[0])
+    
+    if not addresses:
+        print("🤷 No addresses found in the input file.")
+        return
 
-        // Using readline for address input
-        const readline = require('readline').createInterface({
-            input: process.stdin,
-            output: process.stdout
-        });
+    print(f"🚀 Found {len(addresses)} addresses. Creating batches of size {batch_size}...")
+    
+    address_batches = list(create_batches(addresses, batch_size))
+    
+    semaphore = asyncio.Semaphore(concurrency)
+    
+    async with aiofiles.open(output_csv, 'w', newline='', encoding='utf-8') as outfile:
+        fieldnames = ["address", "shortForm", "longForm", "confidence", "error"]
+        writer = AsyncDictWriter(outfile, fieldnames)
+        await writer.writeheader()
 
-        // Promisify the question method
-        const askQuestion = (query) => new Promise((resolve) => readline.question(query, resolve));
+        tasks = [process_address_batch_with_backoff(batch, semaphore, writer) for batch in address_batches]
 
-        console.log('\n👋 Welcome to Address Country Detector!');
-        console.log('Type "exit" or "quit" to end the program\n');
+        await tqdm_asyncio.gather(*tasks, desc="Processing batches")
 
-        while (true) {
-            const address = await askQuestion('\nPlease enter an address: ');
+    print(f"\n✅ Processing complete. Results saved to '{output_csv}'.")
 
-            if (address.toLowerCase() === 'exit' || address.toLowerCase() === 'quit') {
-                console.log('\n👋 Goodbye!');
-                break;
-            }
 
-            try {
-                console.log('\nProcessing address...');
-                const countryInfo = await getCountryFromAddress(address, openai);
-                console.log('✅ Country Information:', countryInfo);
-            } catch (error) {
-                console.error('❌ Error processing this address:', error.message);
-                console.log('Please try another address.');
-            }
-        }
-
-        readline.close();
-    } catch (error) {
-        console.error('Main error:', error);
-    }
-}
-
-// Call main if this file is run directly
-if (require.main === module) {
-    main();
-}
-
-module.exports = { getCountryFromAddress };
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Bulk process addresses from a CSV file to find their country.")
+    parser.add_argument("input_csv", help="Input CSV file with an 'address' column.")
+    parser.add_argument("output_csv", help="Path to save the output CSV file.")
+    parser.add_argument("--concurrency", type=int, default=50, help="Number of concurrent API requests.")
+    parser.add_argument("--batch-size", type=int, default=50, help="Number of addresses to send in each API request.")
+    
+    args = parser.parse_args()
+    
+    asyncio.run(main(args.input_csv, args.output_csv, args.concurrency, args.batch_size)) 
