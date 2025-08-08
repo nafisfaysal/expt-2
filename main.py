@@ -3,19 +3,25 @@ import asyncio
 import aiofiles
 import json
 import argparse
-from openai import AsyncOpenAI, RateLimitError
+import subprocess
+from typing import Dict, List, Optional
+
+import vertexai
+from vertexai.generative_models import GenerativeModel
+from google.oauth2.credentials import Credentials
 from tqdm.asyncio import tqdm_asyncio
 from aiocsv import AsyncReader, AsyncDictWriter
 import random
 import time
 
-# --- Configuration ---
-# WARNING: Storing API keys directly in code is a security risk.
-# This is for temporary, non-production use only.
-# For production, use environment variables.
-API_KEY = "s"
 
-client = AsyncOpenAI(api_key=API_KEY)
+VERTEX_PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT", "pr-gen-ai-9571")
+VERTEX_API_ENDPOINT = os.getenv("R2D2_VERTEX_ENDPOINT")
+VERTEX_MODEL_NAME = os.getenv("VERTEX_MODEL_NAME", "gemini-1.5-pro-002")
+DEFAULT_CA_BUNDLE = r"C:\\citi_ca_certs\\citiInternalCAchain_PROD.pem"
+
+# Lazily initialized global model instance
+_vertex_model: Optional[GenerativeModel] = None
 
 SYSTEM_PROMPT = """You are a highly specialized AI engine designed for one purpose: to accurately identify the country from a given address string. You must be precise and avoid making assumptions.
 
@@ -27,7 +33,7 @@ You will receive a JSON array of address strings in the user message. You MUST r
 Your entire response must be a single JSON object like this. Do not include any other text or explanations.
 {
   "results": [
-    {
+{
       "shortForm": "The 2-letter ISO 3166-1 alpha-2 country code...",
       "longForm": "The full, official English name of the country...",
       "confidence": "A floating-point number from 0.0 to 1.0..."
@@ -91,6 +97,148 @@ For each address in the input batch, apply the following logic:
 }
 """
 
+# --- Vertex Authentication / Init ---
+def _ensure_windows_ca_bundle() -> None:
+    """On Windows, set REQUESTS_CA_BUNDLE to the standard corporate chain if missing.
+
+    Mirrors the screenshot by defaulting to C:\citi_ca_certs\citiInternalCAchain_PROD.pem.
+    """
+    try:
+        if os.name == "nt":
+            if not os.getenv("REQUESTS_CA_BUNDLE") and os.path.exists(DEFAULT_CA_BUNDLE):
+                os.environ["REQUESTS_CA_BUNDLE"] = DEFAULT_CA_BUNDLE
+    except Exception:
+        # Do not block startup if we cannot set it automatically
+        pass
+
+
+def _get_helix_token_via_powershell(helix_dir: Optional[str]) -> Optional[str]:
+    """Attempt to get a token via PowerShell, optionally injecting HELIX_DIR.
+
+    Returns the token string on success; None on failure.
+    """
+    if os.name != "nt":
+        return None
+
+    command = [
+        "powershell",
+        "-NoProfile",
+        "-Command",
+    ]
+
+    if helix_dir:
+        ps = f"$env:HELIX_DIR=\"{helix_dir}\"; helix auth access-token print -a"
+    else:
+        ps = "helix auth access-token print -a"
+
+    command.append(ps)
+
+    try:
+        result = subprocess.run(command, check=True, capture_output=True, text=True)
+        token = result.stdout.strip()
+        return token or None
+    except Exception:
+        return None
+
+
+def _get_helix_access_token() -> str:
+    """Fetch an access token via the helix CLI.
+
+    The command executed is equivalent to: `helix auth access-token print -a`.
+    The helix binary must be available on PATH. If it lives elsewhere, ensure your shell PATH includes it
+    before running this script.
+    """
+    # First, try direct invocation (works when helix is on PATH on any OS)
+    try:
+        result = subprocess.run(
+            ["helix", "auth", "access-token", "print", "-a"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        token = result.stdout.strip()
+        if token:
+            return token
+    except Exception:
+        pass
+
+    # If on Windows, try the PowerShell + HELIX_DIR approach used in your screenshot
+    if os.name == "nt":
+        helix_dir = os.getenv("HELIX_DIR")
+        # Try with HELIX_DIR from env
+        token = _get_helix_token_via_powershell(helix_dir)
+        if token:
+            return token
+
+        # Try a sensible default path if not provided (may vary by workstation)
+        default_dir = os.path.join(
+            os.path.expanduser("~"),
+            "AppData",
+            "Local",
+            "CitiSoftware",
+            "HELIXCLI_0.24",
+        )
+        if os.path.isdir(default_dir):
+            token = _get_helix_token_via_powershell(default_dir)
+            if token:
+                return token
+
+    raise RuntimeError(
+        "Unable to obtain Helix access token. Ensure helix is on PATH or set HELIX_DIR and try again."
+    )
+
+
+def _init_vertex_if_needed() -> None:
+    """Initialize Vertex AI client and the global `GenerativeModel` once."""
+    global _vertex_model
+    if _vertex_model is not None:
+        return
+
+    if not VERTEX_API_ENDPOINT:
+        raise RuntimeError(
+            "R2D2_VERTEX_ENDPOINT env var is required (your R2D2 Vertex endpoint)."
+        )
+
+    _ensure_windows_ca_bundle()
+
+    # Build Google credentials object from helix token
+    access_token = _get_helix_access_token()
+    credentials = Credentials(token=access_token)
+
+    # Optional: pass R2D2 username in metadata header
+    r2d2_user = os.getenv("USERNAME") or os.getenv("USER") or "unknown"
+
+    # Initialize vertex pointing to the R2D2 proxy endpoint
+    vertexai.init(
+        project=VERTEX_PROJECT_ID,
+        credentials=credentials,
+        api_transport="rest",
+        api_endpoint=VERTEX_API_ENDPOINT,
+        metadata={"x-r2d2-user": r2d2_user},
+    )
+
+    _vertex_model = GenerativeModel(VERTEX_MODEL_NAME)
+
+
+def _generate_country_results_sync(addresses: List[str]) -> Dict:
+    """Blocking call to Gemini via Vertex to classify a batch of addresses.
+
+    Returns the parsed JSON object according to the SYSTEM_PROMPT contract.
+    """
+    _init_vertex_if_needed()
+
+    prompt = (
+        SYSTEM_PROMPT
+        + "\n\nAddresses JSON array follows. Respond with the JSON object only.\n"
+        + json.dumps(addresses)
+    )
+
+    response = _vertex_model.generate_content(prompt)
+    # Vertex returns candidates; `.text` is the concatenated string result
+    text = getattr(response, "text", None) or str(response)
+    return json.loads(text)
+
+
 # --- Core Functions ---
 async def process_address_batch_with_backoff(batch, semaphore, writer):
     """
@@ -109,17 +257,9 @@ async def process_address_batch_with_backoff(batch, semaphore, writer):
                 if not valid_addresses:
                     return
 
-                completion = await client.chat.completions.create(
-                    model="gpt-4o",
-                    messages=[
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": json.dumps(valid_addresses)}
-                    ],
-                    temperature=0.1,
-                    response_format={"type": "json_object"}
+                response_data = await asyncio.to_thread(
+                    _generate_country_results_sync, valid_addresses
                 )
-
-                response_data = json.loads(completion.choices[0].message.content)
                 results = response_data.get("results", [])
 
                 for i, address in enumerate(valid_addresses):
@@ -131,7 +271,8 @@ async def process_address_batch_with_backoff(batch, semaphore, writer):
                     await writer.writerow(result_line)
                 return # Success, exit loop
 
-        except RateLimitError as e:
+        except Exception as e:
+            # Retry on transient errors
             num_retries += 1
             if num_retries > max_retries:
                 raise Exception(f"Maximum retries exceeded for batch starting with: {batch[0]}")
@@ -139,11 +280,9 @@ async def process_address_batch_with_backoff(batch, semaphore, writer):
             delay *= exponential_base * (1 + random.random())
             print(f"Rate limit exceeded. Retrying in {delay:.2f} seconds...")
             await asyncio.sleep(delay)
-
-        except Exception as e:
-            for address in batch:
-                await writer.writerow({"address": address, "error": f"Batch failed: {str(e)}"})
-            return # Exit loop after handling non-retryable error
+            
+            # If we want fine-grained control, inspect `e` for HTTP status or google errors
+            # and decide retryability. For now, we backoff on any exception up to max_retries.
 
 
 def create_batches(items, size):
@@ -198,5 +337,8 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=50, help="Number of addresses to send in each API request.")
     
     args = parser.parse_args()
-    
-    asyncio.run(main(args.input_csv, args.output_csv, args.concurrency, args.batch_size)) 
+
+    # Ensure Vertex is initialized early to fail-fast if environment is misconfigured
+    _init_vertex_if_needed()
+
+    asyncio.run(main(args.input_csv, args.output_csv, args.concurrency, args.batch_size))
