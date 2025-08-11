@@ -14,10 +14,10 @@ from aiocsv import AsyncReader, AsyncDictWriter
 
 # --- HARDCODED CONFIGURATION ---
 # Update these values for your environment
-VERTEX_PROJECT_ID = ""
-VERTEX_API_ENDPOINT = ""
+VERTEX_PROJECT_ID = "pr-gen-ai-9571"
+VERTEX_API_ENDPOINT = "https://r2d2-capg-icg-msst-genaihub-178909.apps39023u.ecs.dyn.nsroot.net/vertex"
 VERTEX_MODEL_NAME = "gemini-1.5-pro-002"
-CA_BUNDLE_PATH = r""
+CA_BUNDLE_PATH = r"C:\citi_ca_certs\citiInternalCAchain_PROD.pem"
 
 # Set CA bundle if on Windows
 if os.name == "nt" and os.path.exists(CA_BUNDLE_PATH):
@@ -209,8 +209,9 @@ async def process_batch_with_delay(batch: List[str], batch_num: int, writer, del
         if batch_num > 1:
             await asyncio.sleep(delay)
         
-        # Process the batch
-        response_data = await asyncio.to_thread(process_addresses_sync, batch)
+        # Process the batch (compatible with older Python versions)
+        loop = asyncio.get_event_loop()
+        response_data = await loop.run_in_executor(None, process_addresses_sync, batch)
         results = response_data.get("results", [])
         
         # Write results
