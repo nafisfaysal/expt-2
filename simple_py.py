@@ -15,7 +15,7 @@ from aiocsv import AsyncReader, AsyncDictWriter
 # --- HARDCODED CONFIGURATION ---
 # Update these values for your environment
 VERTEX_PROJECT_ID = "pr-gen-ai-9571"
-VERTEX_API_ENDPOINT = "https://r2d2-capg-icg-msst-genaihub-178909.apps39023u.ecs.dyn.nsroot.net/vertex"
+VERTEX_API_ENDPOINT = ""
 VERTEX_MODEL_NAME = "gemini-1.5-pro-002"
 CA_BUNDLE_PATH = r"C:\citi_ca_certs\citiInternalCAchain_PROD.pem"
 
