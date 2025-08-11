@@ -1,0 +1,327 @@
+import os
+import asyncio
+import aiofiles
+import json
+import argparse
+import subprocess
+import time
+from typing import Dict, List, Optional
+
+import vertexai
+from vertexai.generative_models import GenerativeModel
+from google.oauth2.credentials import Credentials
+from aiocsv import AsyncReader, AsyncDictWriter
+
+# --- HARDCODED CONFIGURATION ---
+# Update these values for your environment
+VERTEX_PROJECT_ID = ""
+VERTEX_API_ENDPOINT = ""
+VERTEX_MODEL_NAME = "gemini-1.5-pro-002"
+CA_BUNDLE_PATH = r""
+
+# Set CA bundle if on Windows
+if os.name == "nt" and os.path.exists(CA_BUNDLE_PATH):
+    os.environ["REQUESTS_CA_BUNDLE"] = CA_BUNDLE_PATH
+
+# Global model instance
+_vertex_model: Optional[GenerativeModel] = None
+
+SYSTEM_PROMPT = """You are a highly specialized AI engine designed for one purpose: to accurately identify the country from a given address string. You must be precise and avoid making assumptions.
+
+Your task is to analyze the provided batch of addresses, which may be incomplete or in any language, and return the country information for each one.
+
+You will receive a JSON array of address strings in the user message. You MUST respond with a valid JSON object containing a single key "results". This key should hold a JSON array of objects, where each object corresponds to an address in the input array and maintains the original order.
+
+### BATCH OUTPUT JSON STRUCTURE
+Your entire response must be a single JSON object like this. Do not include any other text or explanations.
+{
+  "results": [
+{
+      "shortForm": "The 2-letter ISO 3166-1 alpha-2 country code...",
+      "longForm": "The full, official English name of the country...",
+      "confidence": "A floating-point number from 0.0 to 1.0..."
+    },
+    {
+      "shortForm": "...",
+      "longForm": "...",
+      "confidence": "..."
+    }
+  ]
+}
+
+### RULES FOR EACH INDIVIDUAL ADDRESS
+
+For each address in the input batch, apply the following logic:
+
+### Analysis and Confidence Rules
+1.  **Basis of Identification**: Your decision must be based on concrete evidence within the address string. Look for:
+    *   **Postal/ZIP Codes**: Patterns specific to a country (e.g., 5-digit US ZIP, UK postcode format).
+    *   **State/Province/Region**: Abbreviations or full names (e.g., "CA" for California, USA; "Bavaria" for Germany).
+    *   **City Names**: Unambiguous major city names (e.g., "Paris, France"). Be cautious with common city names (e.g., Paris, Texas).
+    *   **Street/Address Terminology**: Language-specific terms (e.g., "Calle" in Spanish, "Rue" in French, "Straße" in German).
+    *   **Country Names**: The presence of the country name itself.
+
+2.  **Calculating Confidence**:
+    *   **1.0**: The country name is explicitly mentioned, or there are multiple, unambiguous indicators (e.g., "10 Downing Street, London, SW1A 2AA, UK").
+    *   **0.8-0.9**: A unique identifier is present, like a specific postal code format or a major city and state combination (e.g., "90210 Beverly Hills, CA").
+    *   **0.5-0.7**: A strong indicator is present, but it could have rare exceptions (e.g., a city name that is very common in one country but exists elsewhere).
+    *   **0.1-0.4**: The only clue is a weak indicator, like a common street name word ("Main Street") or a name that exists in multiple countries.
+    *   **0.0**: No geographic information at all.
+
+3.  **When to use 'UNKNOWN'**:
+    *   If the calculated confidence is less than 0.5, you MUST return 'UNKNOWN' for `shortForm` and `longForm`.
+    *   If the input is gibberish, a single generic word, or lacks any geographical clues (e.g., "my house", "123456").
+    *   If the address is ambiguous and could plausibly belong to multiple countries with similar confidence scores.
+
+### Examples of Individual Address Analysis
+
+**Input Address:** "1600 Pennsylvania Avenue NW, Washington, DC 20500"
+**Resulting JSON Object:**
+{
+  "shortForm": "US",
+  "longForm": "United States",
+  "confidence": 1.0
+}
+
+**Input Address:** "Tour Eiffel, Champ de Mars, 5 Av. Anatole France, 75007 Paris"
+**Resulting JSON Object:**
+{
+  "shortForm": "FR",
+  "longForm": "France",
+  "confidence": 0.9
+}
+
+**Input Address:** "some random street"
+**Resulting JSON Object:**
+{
+  "shortForm": "UNKNOWN",
+  "longForm": "UNKNOWN",
+  "confidence": 0.0
+}
+"""
+
+def get_helix_token() -> str:
+    """Get helix access token"""
+    try:
+        # Try direct helix command first
+        result = subprocess.run(
+            ["helix", "auth", "access-token", "print", "-a"],
+            check=True, capture_output=True, text=True
+        )
+        token = result.stdout.strip()
+        if token:
+            return token
+    except:
+        pass
+    
+    # Try PowerShell on Windows
+    if os.name == "nt":
+        try:
+            ps_cmd = "helix auth access-token print -a"
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps_cmd],
+                check=True, capture_output=True, text=True
+            )
+            token = result.stdout.strip()
+            if token:
+                return token
+        except:
+            pass
+    
+    raise RuntimeError("Cannot get helix token. Ensure helix CLI is available.")
+
+def init_vertex():
+    """Initialize Vertex AI once"""
+    global _vertex_model
+    if _vertex_model:
+        return
+    
+    print("🔐 Getting helix token...")
+    token = get_helix_token()
+    
+    print("🚀 Initializing Vertex AI...")
+    credentials = Credentials(token=token)
+    
+    vertexai.init(
+        project=VERTEX_PROJECT_ID,
+        credentials=credentials,
+        api_transport="rest",
+        api_endpoint=VERTEX_API_ENDPOINT,
+        metadata={"x-r2d2-user": os.getenv("USERNAME", "user")}
+    )
+    
+    _vertex_model = GenerativeModel(VERTEX_MODEL_NAME)
+    print("✅ Vertex AI initialized")
+
+def process_addresses_sync(addresses: List[str]) -> Dict:
+    """Process addresses via Gemini (blocking call)"""
+    init_vertex()
+    
+    prompt = SYSTEM_PROMPT + "\n\nAddresses:\n" + json.dumps(addresses)
+    
+    try:
+        response = _vertex_model.generate_content(prompt)
+        
+        # Handle different response formats
+        response_text = ""
+        if hasattr(response, 'text'):
+            response_text = response.text
+        elif hasattr(response, 'candidates') and response.candidates:
+            response_text = response.candidates[0].content.parts[0].text
+        else:
+            response_text = str(response)
+        
+        # Clean up response text (remove markdown formatting if present)
+        response_text = response_text.strip()
+        if response_text.startswith('```json'):
+            response_text = response_text[7:]
+        if response_text.endswith('```'):
+            response_text = response_text[:-3]
+        response_text = response_text.strip()
+        
+        return json.loads(response_text)
+        
+    except json.JSONDecodeError as e:
+        print(f"⚠️  JSON decode error: {e}")
+        print(f"Response text: {response_text[:200]}...")
+        # Return default structure for failed parsing
+        return {
+            "results": [
+                {"shortForm": "UNKNOWN", "longForm": "UNKNOWN", "confidence": 0.0}
+                for _ in addresses
+            ]
+        }
+    except Exception as e:
+        print(f"⚠️  API call failed: {e}")
+        return {
+            "results": [
+                {"shortForm": "UNKNOWN", "longForm": "UNKNOWN", "confidence": 0.0}
+                for _ in addresses
+            ]
+        }
+
+async def process_batch_with_delay(batch: List[str], batch_num: int, writer, delay: float = 2.0):
+    """Process a single batch with rate limiting"""
+    try:
+        print(f"🔄 Processing batch {batch_num} ({len(batch)} addresses)...")
+        
+        # Add delay between batches to avoid rate limits
+        if batch_num > 1:
+            await asyncio.sleep(delay)
+        
+        # Process the batch
+        response_data = await asyncio.to_thread(process_addresses_sync, batch)
+        results = response_data.get("results", [])
+        
+        # Write results
+        for i, address in enumerate(batch):
+            result_line = {"address": address}
+            if i < len(results) and results[i].get("confidence", 0.0) >= 0.7:
+                result_line.update(results[i])
+            else:
+                result_line["error"] = "Low confidence or processing error"
+            await writer.writerow(result_line)
+        
+        print(f"✅ Batch {batch_num} completed")
+        
+    except Exception as e:
+        print(f"❌ Batch {batch_num} failed: {e}")
+        # Write error for all addresses in failed batch
+        for address in batch:
+            await writer.writerow({
+                "address": address, 
+                "error": f"Batch failed: {str(e)}"
+            })
+
+def create_batches(items: List[str], size: int) -> List[List[str]]:
+    """Split items into batches"""
+    return [items[i:i + size] for i in range(0, len(items), size)]
+
+def test_connection():
+    """Test the connection with a simple address"""
+    print("🧪 Testing connection with sample address...")
+    try:
+        test_addresses = ["1600 Pennsylvania Avenue, Washington DC"]
+        result = process_addresses_sync(test_addresses)
+        print(f"✅ Test successful: {result}")
+        return True
+    except Exception as e:
+        print(f"❌ Test failed: {e}")
+        return False
+
+async def main(input_csv: str, output_csv: str, batch_size: int = 10, delay: float = 2.0):
+    """Main processing function"""
+    if not os.path.isfile(input_csv):
+        print(f"❌ Input file not found: {input_csv}")
+        return
+    
+    # Read addresses
+    print(f"📖 Reading addresses from {input_csv}...")
+    addresses = []
+    async with aiofiles.open(input_csv, 'r', encoding='utf-8') as f:
+        reader = AsyncReader(f)
+        await reader.__anext__()  # Skip header
+        async for row in reader:
+            if row and row[0].strip():
+                addresses.append(row[0].strip())
+    
+    if not addresses:
+        print("❌ No addresses found")
+        return
+    
+    print(f"📊 Found {len(addresses)} addresses")
+    
+    # Create batches
+    batches = create_batches(addresses, batch_size)
+    print(f"📦 Created {len(batches)} batches of {batch_size} addresses each")
+    
+    # Initialize Vertex and test connection
+    if not test_connection():
+        print("❌ Connection test failed. Please check your configuration.")
+        return
+    
+    # Process batches sequentially with delays
+    async with aiofiles.open(output_csv, 'w', encoding='utf-8') as f:
+        fieldnames = ["address", "shortForm", "longForm", "confidence", "error"]
+        writer = AsyncDictWriter(f, fieldnames)
+        await writer.writeheader()
+        
+        for i, batch in enumerate(batches, 1):
+            await process_batch_with_delay(batch, i, writer, delay)
+            
+            # Show progress
+            progress = (i / len(batches)) * 100
+            print(f"📈 Progress: {i}/{len(batches)} batches ({progress:.1f}%)")
+    
+    print(f"\n🎉 Processing complete! Results saved to {output_csv}")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Simple address country detection")
+    parser.add_argument("input_csv", nargs='?', help="Input CSV file with addresses")
+    parser.add_argument("output_csv", nargs='?', help="Output CSV file")
+    parser.add_argument("--batch-size", type=int, default=10, help="Addresses per batch (default: 10)")
+    parser.add_argument("--delay", type=float, default=2.0, help="Delay between batches in seconds (default: 2.0)")
+    parser.add_argument("--test", action="store_true", help="Test connection only")
+    
+    args = parser.parse_args()
+    
+    # Test mode
+    if args.test:
+        print("🧪 Running connection test...")
+        if test_connection():
+            print("🎉 Connection test passed!")
+        else:
+            print("❌ Connection test failed!")
+        exit()
+    
+    # Normal processing mode
+    if not args.input_csv or not args.output_csv:
+        print("❌ Please provide input and output CSV files (or use --test)")
+        parser.print_help()
+        exit()
+    
+    print("🚀 Starting simple address processing...")
+    print(f"📝 Batch size: {args.batch_size}")
+    print(f"⏱️  Delay between batches: {args.delay}s")
+    
+    asyncio.run(main(args.input_csv, args.output_csv, args.batch_size, args.delay))
