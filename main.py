@@ -1,344 +1,298 @@
-import os
-import asyncio
-import aiofiles
-import json
-import argparse
-import subprocess
-from typing import Dict, List, Optional
+#!/usr/bin/env python3
+"""
+TGS Sheet Automation
 
-import vertexai
-from vertexai.generative_models import GenerativeModel
-from google.oauth2.credentials import Credentials
-from tqdm.asyncio import tqdm_asyncio
-from aiocsv import AsyncReader, AsyncDictWriter
-import random
-import time
+This script processes TGS scenario Excel workbooks and extracts only the
+tabs relevant to a target country (e.g., Ecuador -> "EC").
 
+Rules distilled from the provided document:
+  - Workbooks are built per scenario, not per country.
+  - Keep the "Change Log" tab in the output if it exists.
+  - If a country-specific tab exists (e.g., "TGS_EC_ICG"), keep it
+    and drop other country tabs.
+  - Some scenarios (e.g., External Entity) use a shared general tab
+    (e.g., "TGS_EN_GNRL_ICG"). Keep that general tab only if the
+    row with TSHLD_NM == "Incl_Country_LOB_Lst" contains the country
+    in its list (e.g., value includes "LATAM_EC_ICG").
 
-VERTEX_PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT", "pr-gen-ai-9571")
-VERTEX_API_ENDPOINT = os.getenv("R2D2_VERTEX_ENDPOINT")
-VERTEX_MODEL_NAME = os.getenv("VERTEX_MODEL_NAME", "gemini-1.5-pro-002")
-DEFAULT_CA_BUNDLE = r"C:\\citi_ca_certs\\citiInternalCAchain_PROD.pem"
+Outputs a copy of each matching workbook into an output directory,
+retaining only the relevant sheets.
 
-# Lazily initialized global model instance
-_vertex_model: Optional[GenerativeModel] = None
+Usage example:
+  python main.py \
+    --input-dir /path/to/scenarios \
+    --output-dir /path/to/output \
+    --country EC \
+    --region LATAM \
+    --lob ICG
 
-SYSTEM_PROMPT = """You are a highly specialized AI engine designed for one purpose: to accurately identify the country from a given address string. You must be precise and avoid making assumptions.
-
-Your task is to analyze the provided batch of addresses, which may be incomplete or in any language, and return the country information for each one.
-
-You will receive a JSON array of address strings in the user message. You MUST respond with a valid JSON object containing a single key "results". This key should hold a JSON array of objects, where each object corresponds to an address in the input array and maintains the original order.
-
-### BATCH OUTPUT JSON STRUCTURE
-Your entire response must be a single JSON object like this. Do not include any other text or explanations.
-{
-  "results": [
-{
-      "shortForm": "The 2-letter ISO 3166-1 alpha-2 country code...",
-      "longForm": "The full, official English name of the country...",
-      "confidence": "A floating-point number from 0.0 to 1.0..."
-    },
-    {
-      "shortForm": "...",
-      "longForm": "...",
-      "confidence": "..."
-    }
-  ]
-}
-
-### RULES FOR EACH INDIVIDUAL ADDRESS
-
-For each address in the input batch, apply the following logic:
-
-### Analysis and Confidence Rules
-1.  **Basis of Identification**: Your decision must be based on concrete evidence within the address string. Look for:
-    *   **Postal/ZIP Codes**: Patterns specific to a country (e.g., 5-digit US ZIP, UK postcode format).
-    *   **State/Province/Region**: Abbreviations or full names (e.g., "CA" for California, USA; "Bavaria" for Germany).
-    *   **City Names**: Unambiguous major city names (e.g., "Paris, France"). Be cautious with common city names (e.g., Paris, Texas).
-    *   **Street/Address Terminology**: Language-specific terms (e.g., "Calle" in Spanish, "Rue" in French, "Straße" in German).
-    *   **Country Names**: The presence of the country name itself.
-
-2.  **Calculating Confidence**:
-    *   **1.0**: The country name is explicitly mentioned, or there are multiple, unambiguous indicators (e.g., "10 Downing Street, London, SW1A 2AA, UK").
-    *   **0.8-0.9**: A unique identifier is present, like a specific postal code format or a major city and state combination (e.g., "90210 Beverly Hills, CA").
-    *   **0.5-0.7**: A strong indicator is present, but it could have rare exceptions (e.g., a city name that is very common in one country but exists elsewhere).
-    *   **0.1-0.4**: The only clue is a weak indicator, like a common street name word ("Main Street") or a name that exists in multiple countries.
-    *   **0.0**: No geographic information at all.
-
-3.  **When to use 'UNKNOWN'**:
-    *   If the calculated confidence is less than 0.5, you MUST return 'UNKNOWN' for `shortForm` and `longForm`.
-    *   If the input is gibberish, a single generic word, or lacks any geographical clues (e.g., "my house", "123456").
-    *   If the address is ambiguous and could plausibly belong to multiple countries with similar confidence scores.
-
-### Examples of Individual Address Analysis
-
-**Input Address:** "1600 Pennsylvania Avenue NW, Washington, DC 20500"
-**Resulting JSON Object:**
-{
-  "shortForm": "US",
-  "longForm": "United States",
-  "confidence": 1.0
-}
-
-**Input Address:** "Tour Eiffel, Champ de Mars, 5 Av. Anatole France, 75007 Paris"
-**Resulting JSON Object:**
-{
-  "shortForm": "FR",
-  "longForm": "France",
-  "confidence": 0.9
-}
-
-**Input Address:** "some random street"
-**Resulting JSON Object:**
-{
-  "shortForm": "UNKNOWN",
-  "longForm": "UNKNOWN",
-  "confidence": 0.0
-}
+Notes:
+  - Supports .xlsx and .xlsm (macros are preserved if present).
+  - Requires: openpyxl
 """
 
-# --- Vertex Authentication / Init ---
-def _ensure_windows_ca_bundle() -> None:
-    """On Windows, set REQUESTS_CA_BUNDLE to the standard corporate chain if missing.
+from __future__ import annotations
 
-    Mirrors the screenshot by defaulting to C:\citi_ca_certs\citiInternalCAchain_PROD.pem.
+import argparse
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, List, Optional, Sequence, Set, Tuple
+
+from openpyxl import load_workbook
+from openpyxl.worksheet.worksheet import Worksheet
+
+
+# ----------------------------
+# Configuration data structure
+# ----------------------------
+
+
+@dataclass(frozen=True)
+class ExtractConfig:
+    input_dir: Path
+    output_dir: Path
+    country_code: str  # e.g., "EC"
+    region: str = "LATAM"  # e.g., "LATAM"
+    lob: str = "ICG"  # e.g., "ICG"
+    dry_run: bool = False
+
+    def normalized_country(self) -> str:
+        return self.country_code.strip().upper()
+
+    def country_tab_name(self) -> str:
+        return f"TGS_{self.normalized_country()}_{self.lob.upper()}"
+
+    def en_general_tab_name(self) -> str:
+        return f"TGS_EN_GNRL_{self.lob.upper()}"
+
+    def region_country_key(self) -> str:
+        """Returns the membership key used in Incl_Country_LOB_Lst."""
+        return f"{self.region.upper()}_{self.normalized_country()}_{self.lob.upper()}"
+
+
+# ----------------------------
+# Helpers
+# ----------------------------
+
+
+CHANGE_LOG_CANDIDATES: Tuple[str, ...] = (
+    "Change Log",
+    "ChangeLog",
+    "CHANGE LOG",
+    "CHANGE_LOG",
+)
+
+
+def normalize_string(value: object) -> str:
+    if value is None:
+        return ""
+    text = str(value)
+    return (
+        text.strip()
+        .replace("\u2013", "-")
+        .replace("\u2014", "-")
+        .replace("\xa0", " ")
+    )
+
+
+def sheet_exists(sheet_names: Sequence[str], name: str) -> bool:
+    name_norm = name.strip().lower()
+    return any(s.strip().lower() == name_norm for s in sheet_names)
+
+
+def find_change_log_sheet(sheet_names: Sequence[str]) -> Optional[str]:
+    for candidate in CHANGE_LOG_CANDIDATES:
+        if sheet_exists(sheet_names, candidate):
+            return next(s for s in sheet_names if s.strip().lower() == candidate.strip().lower())
+    return None
+
+
+def contains_country_in_en_general(ws: Worksheet, membership_key: str) -> bool:
+    """Return True if the EN general sheet includes the country in Incl_Country_LOB_Lst.
+
+    Strategy:
+      1) Try to locate a cell whose normalized value == "incl_country_lob_lst".
+         If found, search that row for the membership_key.
+      2) Fallback: scan entire sheet for membership_key substring.
     """
+
+    target_label = "incl_country_lob_lst"
+    membership_key_norm = membership_key.strip().upper()
+
+    # 1) Targeted scan by label
     try:
-        if os.name == "nt":
-            if not os.getenv("REQUESTS_CA_BUNDLE") and os.path.exists(DEFAULT_CA_BUNDLE):
-                os.environ["REQUESTS_CA_BUNDLE"] = DEFAULT_CA_BUNDLE
+        for row in ws.iter_rows(values_only=False):
+            for cell in row:
+                value = normalize_string(cell.value)
+                if value and value.replace(" ", "").replace("-", "_").replace("__", "_").lower() == target_label:
+                    # Consider entire row's textual content for membership
+                    row_text = " | ".join(normalize_string(c.value) for c in row)
+                    if membership_key_norm in row_text.upper():
+                        return True
+                    # Also look to the right in a wider window (some files put the list several columns away)
+                    max_col = ws.max_column
+                    values_right: List[str] = []
+                    for c in range(cell.column, max_col + 1):
+                        values_right.append(normalize_string(ws.cell(row=cell.row, column=c).value))
+                    if membership_key_norm in " | ".join(values_right).upper():
+                        return True
+                    # Not found in this row; keep scanning other rows
     except Exception:
-        # Do not block startup if we cannot set it automatically
+        # Be permissive; fall back to broad scan
         pass
 
-
-def _get_helix_token_via_powershell(helix_dir: Optional[str]) -> Optional[str]:
-    """Attempt to get a token via PowerShell, optionally injecting HELIX_DIR.
-
-    Returns the token string on success; None on failure.
-    """
-    if os.name != "nt":
-        return None
-
-    command = [
-        "powershell",
-        "-NoProfile",
-        "-Command",
-    ]
-
-    if helix_dir:
-        ps = f"$env:HELIX_DIR=\"{helix_dir}\"; helix auth access-token print -a"
-    else:
-        ps = "helix auth access-token print -a"
-
-    command.append(ps)
-
+    # 2) Broad scan across all cells (slower but robust)
     try:
-        result = subprocess.run(command, check=True, capture_output=True, text=True)
-        token = result.stdout.strip()
-        return token or None
-    except Exception:
-        return None
-
-
-def _get_helix_access_token() -> str:
-    """Fetch an access token via the helix CLI.
-
-    The command executed is equivalent to: `helix auth access-token print -a`.
-    The helix binary must be available on PATH. If it lives elsewhere, ensure your shell PATH includes it
-    before running this script.
-    """
-    # First, try direct invocation (works when helix is on PATH on any OS)
-    try:
-        result = subprocess.run(
-            ["helix", "auth", "access-token", "print", "-a"],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        token = result.stdout.strip()
-        if token:
-            return token
+        for row in ws.iter_rows(values_only=True):
+            for value in row:
+                if value and membership_key_norm in str(value).upper():
+                    return True
     except Exception:
         pass
 
-    # If on Windows, try the PowerShell + HELIX_DIR approach used in your screenshot
-    if os.name == "nt":
-        helix_dir = os.getenv("HELIX_DIR")
-        # Try with HELIX_DIR from env
-        token = _get_helix_token_via_powershell(helix_dir)
-        if token:
-            return token
-
-        # Try a sensible default path if not provided (may vary by workstation)
-        default_dir = os.path.join(
-            os.path.expanduser("~"),
-            "AppData",
-            "Local",
-            "CitiSoftware",
-            "HELIXCLI_0.24",
-        )
-        if os.path.isdir(default_dir):
-            token = _get_helix_token_via_powershell(default_dir)
-            if token:
-                return token
-
-    raise RuntimeError(
-        "Unable to obtain Helix access token. Ensure helix is on PATH or set HELIX_DIR and try again."
-    )
+    return False
 
 
-def _init_vertex_if_needed() -> None:
-    """Initialize Vertex AI client and the global `GenerativeModel` once."""
-    global _vertex_model
-    if _vertex_model is not None:
-        return
+def compute_sheets_to_keep(sheet_names: Sequence[str], ws_en_general: Optional[Worksheet], cfg: ExtractConfig) -> Set[str]:
+    keep: Set[str] = set()
 
-    if not VERTEX_API_ENDPOINT:
-        raise RuntimeError(
-            "R2D2_VERTEX_ENDPOINT env var is required (your R2D2 Vertex endpoint)."
-        )
+    # Always try to keep change log if present
+    change_log = find_change_log_sheet(sheet_names)
+    if change_log:
+        keep.add(change_log)
 
-    _ensure_windows_ca_bundle()
+    # Country-specific tab
+    country_tab = cfg.country_tab_name()
+    if sheet_exists(sheet_names, country_tab):
+        # Use the canonical casing from the workbook
+        keep.add(next(s for s in sheet_names if s.strip().lower() == country_tab.strip().lower()))
 
-    # Build Google credentials object from helix token
-    access_token = _get_helix_access_token()
-    credentials = Credentials(token=access_token)
+    # EN general tab conditionally
+    en_general_tab = cfg.en_general_tab_name()
+    if sheet_exists(sheet_names, en_general_tab) and ws_en_general is not None:
+        if contains_country_in_en_general(ws_en_general, cfg.region_country_key()):
+            keep.add(next(s for s in sheet_names if s.strip().lower() == en_general_tab.strip().lower()))
 
-    # Optional: pass R2D2 username in metadata header
-    r2d2_user = os.getenv("USERNAME") or os.getenv("USER") or "unknown"
-
-    # Initialize vertex pointing to the R2D2 proxy endpoint
-    vertexai.init(
-        project=VERTEX_PROJECT_ID,
-        credentials=credentials,
-        api_transport="rest",
-        api_endpoint=VERTEX_API_ENDPOINT,
-        metadata={"x-r2d2-user": r2d2_user},
-    )
-
-    _vertex_model = GenerativeModel(VERTEX_MODEL_NAME)
+    return keep
 
 
-def _generate_country_results_sync(addresses: List[str]) -> Dict:
-    """Blocking call to Gemini via Vertex to classify a batch of addresses.
+def process_workbook(path: Path, cfg: ExtractConfig) -> Optional[Path]:
+    """Process a single Excel workbook and save a filtered copy if relevant.
 
-    Returns the parsed JSON object according to the SYSTEM_PROMPT contract.
+    Returns the path to the output file if a filtered workbook was written,
+    otherwise returns None (e.g., no relevant sheets for the target country).
     """
-    _init_vertex_if_needed()
 
-    prompt = (
-        SYSTEM_PROMPT
-        + "\n\nAddresses JSON array follows. Respond with the JSON object only.\n"
-        + json.dumps(addresses)
+    if not path.suffix.lower() in {".xlsx", ".xlsm"}:
+        return None
+
+    # keep_vba=True conserves macros if the file is .xlsm
+    keep_vba = path.suffix.lower() == ".xlsm"
+    try:
+        wb = load_workbook(filename=str(path), read_only=False, data_only=False, keep_vba=keep_vba)
+    except Exception as exc:
+        print(f"[WARN] Skipping {path.name}: failed to open workbook ({exc})")
+        return None
+
+    sheet_names: List[str] = list(wb.sheetnames)
+    ws_en: Optional[Worksheet] = None
+    if sheet_exists(sheet_names, cfg.en_general_tab_name()):
+        ws_en = wb[cfg.en_general_tab_name()]
+
+    keep = compute_sheets_to_keep(sheet_names, ws_en, cfg)
+
+    # If we do not keep any country-relevant tab (neither country-specific nor EN general),
+    # do not output.
+    country_relevant = any(
+        s.lower() in {cfg.country_tab_name().lower(), cfg.en_general_tab_name().lower()} for s in keep
     )
+    if not country_relevant:
+        return None
 
-    response = _vertex_model.generate_content(prompt)
-    # Vertex returns candidates; `.text` is the concatenated string result
-    text = getattr(response, "text", None) or str(response)
-    return json.loads(text)
+    if cfg.dry_run:
+        print(f"[DRY-RUN] {path.name}: would keep -> {sorted(keep)}")
+        return path  # indicate relevance without writing
 
-
-# --- Core Functions ---
-async def process_address_batch_with_backoff(batch, semaphore, writer):
-    """
-    Analyzes a batch of addresses with exponential backoff for retries.
-    """
-    initial_delay = 1
-    exponential_base = 2
-    max_retries = 10
-    num_retries = 0
-    delay = initial_delay
-
-    while True:
+    # Remove all other sheets
+    to_remove = [s for s in sheet_names if s not in keep]
+    for sheet in to_remove:
         try:
-            async with semaphore:
-                valid_addresses = [addr for addr in batch if addr and addr.strip()]
-                if not valid_addresses:
-                    return
+            wb.remove(wb[sheet])
+        except Exception as exc:
+            print(f"[WARN] {path.name}: failed to remove sheet '{sheet}': {exc}")
 
-                response_data = await asyncio.to_thread(
-                    _generate_country_results_sync, valid_addresses
-                )
-                results = response_data.get("results", [])
+    # Ensure output dir exists
+    cfg.output_dir.mkdir(parents=True, exist_ok=True)
 
-                for i, address in enumerate(valid_addresses):
-                    result_line = {"address": address}
-                    if i < len(results) and results[i].get("confidence", 0.0) >= 0.7 and results[i].get("shortForm") != "UNKNOWN":
-                        result_line.update(results[i])
-                    else:
-                        result_line["error"] = "Confidence too low or unknown"
-                    await writer.writerow(result_line)
-                return # Success, exit loop
+    # Compose output file name
+    out_name = f"{path.stem}__{cfg.normalized_country()}{path.suffix}"
+    out_path = cfg.output_dir / out_name
 
-        except Exception as e:
-            # Retry on transient errors
-            num_retries += 1
-            if num_retries > max_retries:
-                raise Exception(f"Maximum retries exceeded for batch starting with: {batch[0]}")
-            
-            delay *= exponential_base * (1 + random.random())
-            print(f"Rate limit exceeded. Retrying in {delay:.2f} seconds...")
-            await asyncio.sleep(delay)
-            
-            # If we want fine-grained control, inspect `e` for HTTP status or google errors
-            # and decide retryability. For now, we backoff on any exception up to max_retries.
+    try:
+        wb.save(str(out_path))
+        print(f"[OK] Wrote {out_path.name}: kept {sorted(keep)}")
+        return out_path
+    except Exception as exc:
+        print(f"[ERROR] Failed to save '{out_path.name}': {exc}")
+        return None
 
 
-def create_batches(items, size):
-    """Yield successive n-sized chunks from list."""
-    for i in range(0, len(items), size):
-        yield items[i:i + size]
+def iter_workbooks(input_dir: Path) -> Iterable[Path]:
+    for p in sorted(input_dir.glob("**/*")):
+        if p.is_file() and p.suffix.lower() in {".xlsx", ".xlsm"}:
+            yield p
 
-# --- Main Execution ---
-async def main(input_csv: str, output_csv: str, concurrency: int, batch_size: int):
-    """
-    Main function to orchestrate the bulk processing of addresses from a CSV file.
-    """
-    if not os.path.isfile(input_csv):
-        print(f"❌ Error: Input CSV file '{input_csv}' not found.")
-        return
 
-    addresses = []
-    async with aiofiles.open(input_csv, 'r', newline='', encoding='utf-8') as infile:
-        reader = AsyncReader(infile)
-        await reader.__anext__() # Skip header
-        async for row in reader:
-            if row:
-                addresses.append(row[0])
-    
-    if not addresses:
-        print("🤷 No addresses found in the input file.")
-        return
+def parse_args(argv: Optional[Sequence[str]] = None) -> ExtractConfig:
+    parser = argparse.ArgumentParser(description="Extract country-relevant sheets from TGS workbooks")
+    parser.add_argument("--input-dir", required=True, type=Path, help="Directory containing scenario workbooks (.xlsx/.xlsm)")
+    parser.add_argument("--output-dir", required=True, type=Path, help="Directory to write filtered copies")
+    parser.add_argument("--country", required=True, help="2-letter country code, e.g., EC for Ecuador")
+    parser.add_argument("--region", default="LATAM", help="Region prefix used in Incl_Country_LOB_Lst (default: LATAM)")
+    parser.add_argument("--lob", default="ICG", help="LOB suffix used in sheet names (default: ICG)")
+    parser.add_argument("--dry-run", action="store_true", help="Do not write files; only print what would be kept")
 
-    print(f"🚀 Found {len(addresses)} addresses. Creating batches of size {batch_size}...")
-    
-    address_batches = list(create_batches(addresses, batch_size))
-    
-    semaphore = asyncio.Semaphore(concurrency)
-    
-    async with aiofiles.open(output_csv, 'w', newline='', encoding='utf-8') as outfile:
-        fieldnames = ["address", "shortForm", "longForm", "confidence", "error"]
-        writer = AsyncDictWriter(outfile, fieldnames)
-        await writer.writeheader()
+    args = parser.parse_args(argv)
+    return ExtractConfig(
+        input_dir=args.input_dir,
+        output_dir=args.output_dir,
+        country_code=args.country,
+        region=args.region,
+        lob=args.lob,
+        dry_run=args.dry_run,
+    )
 
-        tasks = [process_address_batch_with_backoff(batch, semaphore, writer) for batch in address_batches]
 
-        await tqdm_asyncio.gather(*tasks, desc="Processing batches")
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    cfg = parse_args(argv)
 
-    print(f"\n✅ Processing complete. Results saved to '{output_csv}'.")
+    if not cfg.input_dir.exists():
+        print(f"[ERROR] Input dir does not exist: {cfg.input_dir}")
+        return 2
+
+    matched = 0
+    written = 0
+    for path in iter_workbooks(cfg.input_dir):
+        result = process_workbook(path, cfg)
+        if result is not None:
+            matched += 1
+            # In dry-run, result is the input path; in write-mode, it's the output path
+            if not cfg.dry_run:
+                written += 1
+
+    if matched == 0:
+        print("[INFO] No relevant scenarios found for the specified country.")
+    else:
+        if cfg.dry_run:
+            print(f"[INFO] {matched} relevant workbook(s) would be produced (dry-run)")
+        else:
+            print(f"[INFO] Wrote {written} filtered workbook(s) for country {cfg.normalized_country()}")
+
+    return 0
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Bulk process addresses from a CSV file to find their country.")
-    parser.add_argument("input_csv", help="Input CSV file with an 'address' column.")
-    parser.add_argument("output_csv", help="Path to save the output CSV file.")
-    parser.add_argument("--concurrency", type=int, default=50, help="Number of concurrent API requests.")
-    parser.add_argument("--batch-size", type=int, default=50, help="Number of addresses to send in each API request.")
-    
-    args = parser.parse_args()
+    raise SystemExit(main())
 
-    # Ensure Vertex is initialized early to fail-fast if environment is misconfigured
-    _init_vertex_if_needed()
 
-    asyncio.run(main(args.input_csv, args.output_csv, args.concurrency, args.batch_size))
